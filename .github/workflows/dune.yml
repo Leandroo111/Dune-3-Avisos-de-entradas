@@ -1,0 +1,81 @@
+name: dune-alert
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Solo mandar un aviso de prueba"
+        type: boolean
+        default: false
+      url:
+        description: "URL a vigilar (vacío = Duna: parte tres)"
+        type: string
+        default: ""
+
+# Un solo job a la vez: el siguiente espera a que termine el anterior
+concurrency:
+  group: dune-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Configurá solo los canales que uses (mail y/o ntfy); los secrets vacíos se ignoran
+    env:
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      MAIL_FROM: ${{ secrets.MAIL_FROM }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Cache de Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - run: playwright install --with-deps chromium
+
+      - name: Aviso de prueba
+        if: ${{ inputs.test_email }}
+        run: python dune_alert.py --test-email
+
+      - name: Vigilar la cartelera
+        if: ${{ !inputs.test_email }}
+        env:
+          URL_OVERRIDE: ${{ inputs.url }}
+        run: python dune_alert.py --duration 28 --interval 60 --dump dump.txt ${URL_OVERRIDE:+--url "$URL_OVERRIDE"}
+
+      - name: Guardar texto que vio el bot (para depurar)
+        if: ${{ always() && !inputs.test_email }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dump
+          path: dump.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Guardar estado
+        if: ${{ always() }}
+        run: |
+          git config user.name "dune-bot"
+          git config user.email "dune-bot@users.noreply.github.com"
+          git add dune_state.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "estado" && git pull --rebase && git push)
