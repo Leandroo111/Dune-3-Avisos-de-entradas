@@ -21,6 +21,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write   # para que cada corrida pueda lanzar la siguiente
 
 jobs:
   watch:
@@ -58,6 +59,7 @@ jobs:
         run: python dune_alert.py --test-email
 
       - name: Vigilar la cartelera
+        id: watch
         if: ${{ !inputs.test_email }}
         env:
           URL_OVERRIDE: ${{ inputs.url }}
@@ -79,3 +81,12 @@ jobs:
           git config user.email "dune-bot@users.noreply.github.com"
           git add dune_state.json 2>/dev/null || true
           git diff --cached --quiet || (git commit -m "estado" && git pull --rebase && git push)
+
+      # Cada corrida lanza la siguiente (sin depender del cron de GitHub, que a veces demora o se saltea).
+      # No relanza si cancelás la corrida a mano ni si el bot falló: en ese caso retoma el cron.
+      - name: Relanzar para seguir sin huecos
+        if: ${{ !cancelled() && !inputs.test_email && steps.watch.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run dune.yml --ref "${{ github.ref_name }}"
