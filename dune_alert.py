@@ -7,7 +7,8 @@ Solo avisa de funciones que nunca había visto: si una función desaparece y vue
 aparecer (por ejemplo, por una carga a medias de la página), no cuenta como nueva.
 El estado "agotada" se ignora por completo.
 
-La página carga las funciones con JavaScript, así que se usa un navegador real (Playwright).
+La página carga las funciones con JavaScript y muestra un día a la vez (una pestaña por fecha),
+así que el bot usa un navegador real (Playwright) y hace clic en cada fecha para leerlas todas.
 
 Instalación local:
     pip install -r requirements.txt
@@ -46,6 +47,8 @@ DATE_RE = re.compile(
     r"\b\d{1,2}/\d{1,2}\b|\b(?:lun|mar|mi[eé]|jue|vie|s[aá]b|dom)\w*\.?\s+\d{1,2}\b",
     re.I,
 )
+DATE_ONLY_RE = re.compile(r"^(?:lun|mar|mi[eé]|jue|vie|s[aá]b|dom)\w*\.?\s+\d{1,2}/\d{1,2}$", re.I)
+FORMAT_RE = re.compile(r"subtitulad|doblad|castellano|^\s*[234]d\b|^\s*imax\s*[-–]", re.I)
 # Palabras de "agotada" que se borran de las líneas para que no afecten la detección
 SOLDOUT_RE = re.compile(r"agotad\w*|sold[\s_-]?out|sin\s+(?:entradas|disponibilidad|lugares|butacas)", re.I)
 HEADERS = {
@@ -57,6 +60,7 @@ HEADERS = {
 }
 FAIL_ALERT_THRESHOLD = 10  # fallos seguidos (entre corridas) antes de avisarte
 MAX_LINE = 80  # ignora párrafos largos (sinopsis, etc.)
+STATE_VERSION = 2
 BROWSER_WAIT_MS = 5000  # espera extra para que termine "cargando funciones..."
 
 
@@ -65,19 +69,7 @@ def log(msg):
 
 
 # ---------- obtención de la página ----------
-def fetch_html(url, use_browser=True):
-    if use_browser:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            try:
-                page = browser.new_page(extra_http_headers=HEADERS)
-                page.goto(url, wait_until="networkidle", timeout=60000)
-                page.wait_for_timeout(BROWSER_WAIT_MS)
-                return page.content()
-            finally:
-                browser.close()
+def fetch_plain(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     if "charset" not in r.headers.get("content-type", "").lower():
@@ -85,7 +77,6 @@ def fetch_html(url, use_browser=True):
     return r.text
 
 
-# ---------- lectura de la página ----------
 def page_lines(html):
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
@@ -93,34 +84,99 @@ def page_lines(html):
     return [l for l in soup.get_text("\n", strip=True).split("\n") if l]
 
 
-def extract_showtimes(lines):
-    """Devuelve un Counter {"contexto → fecha hora": cantidad}.
-    El contexto son las 2 últimas líneas que no son fecha/hora (complejo, formato, etc.)."""
+def click_date(page, label):
+    """Hace clic en la pestaña de una fecha y espera a que carguen sus funciones."""
+    try:
+        for loc in page.get_by_text(label, exact=True).all():
+            if not loc.is_visible():
+                continue
+            loc.click(timeout=5000)
+            page.wait_for_timeout(400)
+            for waiter in (
+                lambda: page.wait_for_load_state("networkidle", timeout=10000),
+                lambda: page.wait_for_function(
+                    "() => !document.body.innerText.toLowerCase().includes('cargando funciones')", timeout=10000
+                ),
+            ):
+                try:
+                    waiter()
+                except Exception:  # noqa: BLE001
+                    pass
+            page.wait_for_timeout(500)
+            return True
+    except Exception as e:  # noqa: BLE001
+        log(f"No se pudo abrir la fecha {label}: {e}")
+    return False
+
+
+def fetch_pages(url, args):
+    """Devuelve [(None, html_inicial), (fecha, html_de_esa_fecha), ...]."""
+    if args.no_browser:
+        html = fetch_plain(url)
+        return [(None, html), ("(día mostrado)", html)]
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page(extra_http_headers=HEADERS)
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(BROWSER_WAIT_MS)
+            first = page.content()
+            pages = [(None, first)]
+            for label in dict.fromkeys(l for l in page_lines(first) if DATE_ONLY_RE.match(l)):
+                if click_date(page, label):
+                    pages.append((label, page.content()))
+                else:
+                    log(f"Fecha omitida: {label}")
+            return pages
+        finally:
+            browser.close()
+
+
+# ---------- lectura de la página ----------
+def extract_showtimes(lines, date, only=None):
+    """Devuelve un Counter {"fecha | complejo / formato → horario": cantidad}.
+    Si `only` (regex) está definido, solo cuenta las funciones cuyo complejo/formato lo cumple."""
     items = Counter()
-    labels = deque(maxlen=2)
-    last_date = ""
+    complejo = formato = ""
     for line in lines:
         line = SOLDOUT_RE.sub("", line).strip(" -–·|")
-        if not line or len(line) > MAX_LINE:
+        if not line or len(line) > MAX_LINE or DATE_ONLY_RE.match(line):
             continue
-        ctx = " / ".join(labels)
-        has_time, has_date = TIME_RE.search(line), DATE_RE.search(line)
-        if has_time:
-            when = line if has_date else f"{last_date} {line}".strip()
-            items[f"{ctx} → {when}" if ctx else when] += 1
-        elif has_date:
-            last_date = line
-            items[f"{ctx} → {line}" if ctx else line] += 1
+        if TIME_RE.search(line):
+            ctx = " / ".join(x for x in (complejo, formato) if x)
+            if only and not only.search(ctx):
+                continue
+            items[f"{date} | {ctx} → {line}" if ctx else f"{date} → {line}"] += 1
+        elif FORMAT_RE.search(line):
+            formato = line
         else:
-            labels.append(line)
+            complejo, formato = line, ""
     return items
 
 
 def read_items(url, args, expect):
-    lines = page_lines(fetch_html(url, not args.no_browser))
-    if expect and not any(expect in l.lower() for l in lines):
+    pages = fetch_pages(url, args)
+    first_lines = page_lines(pages[0][1])
+    if expect and not any(expect in l.lower() for l in first_lines):
         raise RuntimeError(f"la página no contiene '{expect}' (¿bloqueo o error de carga?)")
-    return extract_showtimes(lines), lines
+    tabs = list(dict.fromkeys(l for l in first_lines if DATE_ONLY_RE.match(l)))
+    if not tabs:
+        raise RuntimeError("no se encontraron las fechas (pestañas) de la página")
+    only = re.compile(args.only, re.I) if args.only else None
+    items, dump = Counter(), []
+    leidas = 0
+    for date, html in pages[1:]:
+        lines = page_lines(html)
+        items.update(extract_showtimes(lines, date, only))
+        dump.append(f"=== {date} ===\n" + "\n".join(lines))
+        leidas += 1
+    if not leidas:
+        raise RuntimeError("no se pudo abrir ninguna fecha")
+    if leidas < len(tabs):
+        log(f"Ojo: se leyeron {leidas} de {len(tabs)} fechas.")
+    return items, "\n\n".join(dump)
 
 
 # ---------- avisos ----------
@@ -197,7 +253,7 @@ def find_new(items, seen):
 def check(url, args, state, expect):
     fails = state.setdefault("_fails", {})
     try:
-        items, lines = read_items(url, args, expect)
+        items, dump = read_items(url, args, expect)
     except Exception as e:  # noqa: BLE001
         fails[url] = fails.get(url, 0) + 1
         log(f"Error leyendo la página: {e} ({fails[url]} seguidos)")
@@ -211,12 +267,12 @@ def check(url, args, state, expect):
         return
     fails[url] = 0
     if args.dump:
-        Path(args.dump).write_text("\n".join(lines), encoding="utf-8")
+        Path(args.dump).write_text(dump, encoding="utf-8")
 
     prev = state.get(url) or {}
-    seen = prev.get("seen") if "seen" in prev else prev.get("items")  # "items" = formato viejo
+    seen = prev.get("seen") if prev.get("v") == STATE_VERSION else None  # estado de otra versión → línea base nueva
     if seen is None:
-        state[url] = {"seen": dict(items)}
+        state[url] = {"v": STATE_VERSION, "seen": dict(items)}
         log(f"Línea base guardada: {sum(items.values())} horarios/fechas detectados.")
         if not items:
             log("Ojo: no se detectó ninguna función. Revisá con --dump qué ve el bot.")
@@ -240,20 +296,17 @@ def check(url, args, state, expect):
 
     for k, c in items.items():
         seen[k] = max(seen.get(k, 0), c)
-    state[url] = {"seen": seen}
+    state[url] = {"v": STATE_VERSION, "seen": seen}
     if not new:
         log(f"Sin funciones nuevas ({sum(items.values())} detectadas).")
         return
 
-    is_imax = lambda k: "imax" in k.lower()
-    ordered = sorted(new.items(), key=lambda kv: not is_imax(kv[0]))
-    hay_imax = any(is_imax(k) for k in new)
     body = (
-        "Funciones nuevas (⭐ = IMAX):\n"
-        + "\n".join(f"  {'⭐' if is_imax(k) else '•'} {k}" + (f" (x{v})" if v > 1 else "") for k, v in ordered)
+        "Funciones nuevas:\n"
+        + "\n".join(f"  ⭐ {k}" + (f" (x{v})" if v > 1 else "") for k, v in sorted(new.items()))
         + f"\n\nComprá acá: {url}\n"
     )
-    notify("🎬 Duna: parte tres — ¡funciones nuevas!" + (" (hay IMAX)" if hay_imax else ""), body, args.dry_run, click=url, priority=5 if hay_imax else 4)
+    notify("🎬 Duna: parte tres — ¡funciones nuevas en IMAX!" if args.only else "🎬 Duna: parte tres — ¡funciones nuevas!", body, args.dry_run, click=url, priority=5)
 
 
 def main():
@@ -265,6 +318,7 @@ def main():
     ap.add_argument("--dump", default="", help="guarda el texto que ve el bot, para depurar")
     ap.add_argument("--expect", default=None, help="texto que debe aparecer en la página (si no, se cuenta como error)")
     ap.add_argument("--confirm-wait", type=int, default=10, help="segundos antes de re-confirmar una función nueva")
+    ap.add_argument("--only", default="IMAX", help='solo vigila funciones cuyo complejo/formato coincide con este texto (regex; "" = todas)')
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
